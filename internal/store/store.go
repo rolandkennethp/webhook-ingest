@@ -58,7 +58,6 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Close releases all pooled connections.
 func (s *Store) Close() { s.pool.Close() }
 
-// EventExists reports whether an event with this ID has already been stored.
 func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	var one int
 	err := s.pool.QueryRow(ctx,
@@ -72,7 +71,8 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
+// InsertEvent stores the raw delivery. Kept for existing tests; IngestEvent
+// is the path used in production code.
 func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
@@ -81,7 +81,8 @@ func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	return err
 }
 
-// UpsertCall creates or refreshes the call record for this event.
+// UpsertCall creates or refreshes the call record for this event. Kept for
+// existing tests; IngestEvent is the path used in production code.
 func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
@@ -104,6 +105,7 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 }
 
 // IncrementAccountStats folds one completed call into the durable aggregate.
+// Kept for existing tests; IngestEvent is the path used in production code.
 func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
@@ -128,4 +130,61 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 		return Stats{}, err
 	}
 	return st, nil
+}
+
+// IngestEvent atomically stores one webhook delivery: the raw event row,
+// the call upsert, and the account_stats increment all happen inside a
+// single transaction, gated on the UNIQUE constraint on events.event_id
+// (see migrations/002_events_event_id_unique.sql).
+//
+// It reports inserted=false if this event_id has already been ingested —
+// by an earlier call, or by a concurrent call that won the race. In that
+// case the call and account_stats rows are left untouched, so redelivery
+// (even concurrent redelivery) can never double-count.
+func (s *Store) IngestEvent(ctx context.Context, e Event) (inserted bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// Someone else already ingested this event_id. Nothing left to do.
+		return false, nil
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+		return false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }

@@ -86,3 +86,51 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+// TestIngestEventIsIdempotent proves the transactional insert/upsert path
+// directly: calling IngestEvent twice with the same event_id must insert
+// exactly once and increment account_stats exactly once, regardless of how
+// many times the same delivery is replayed.
+func TestIngestEventIsIdempotent(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 30, Payload: []byte(`{}`),
+	}
+
+	inserted, err := s.IngestEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first IngestEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first IngestEvent: want inserted=true")
+	}
+
+	inserted, err = s.IngestEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("second IngestEvent: %v", err)
+	}
+	if inserted {
+		t.Fatal("second IngestEvent: want inserted=false for a duplicate event_id")
+	}
+
+	var eventCount int
+	row := s.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&eventCount); err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("stored %d copies of the event, want 1", eventCount)
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 30 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=30", got)
+	}
+}
