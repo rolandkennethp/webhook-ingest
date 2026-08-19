@@ -1,0 +1,17 @@
+# SOLUTION.md
+
+## What was broken, and why
+
+The service acknowledged webhook deliveries with 200 before it could actually guarantee they'd only be processed once. Ingestion followed a check-then-act pattern: it looked up whether `event_id` already existed, and only then inserted it. That gap between the check and the write is exactly where two concurrent deliveries of the same event both read "not yet stored" and both proceeded — producing duplicate call records and double-counted `account_stats`. The database didn't help either: `events.event_id` only had a plain index, not a uniqueness constraint, so nothing stopped two rows with the same ID from existing side by side.
+
+Recordings not getting marked processed turned out to be a context bug, not a logic bug. The background goroutine that processes a recording was using the _HTTP request's_ context. Once the response was written, that context could be canceled, killing the goroutine's database write mid-flight — and the error was thrown away (`// TODO: handle`), so nothing showed up in the logs.
+
+In-flight work disappearing on deploy was a consequence of the same goroutine: it was fire-and-forget, with nothing tracking it. `http.Server.Shutdown()` only waits for in-flight _HTTP requests_, not detached goroutines a handler happened to spawn — so on every deploy, any recording processing mid-flight when the process received SIGTERM just vanished.
+
+## Why this deduplication strategy over the alternatives
+
+I put a UNIQUE constraint on `events.event_id` and made the insert, call upsert, and stats increment happen in one transaction, using `ON CONFLICT DO NOTHING` to detect a duplicate. I considered checking Redis for `event_id` (e.g. `SETNX`) before touching Postgres, since Redis was already available. I ruled it out because it can't be made atomic with the Postgres writes — a crash between "marked seen in Redis" and "committed to Postgres" either loses the event or blocks a write that never actually landed. Postgres already has to be the transactional boundary for `calls` and `account_stats`, so the uniqueness check belongs in that same transaction rather than in a second system that can drift out of sync with it. A database-enforced constraint also handles true concurrency correctly: two simultaneous inserts of the same `event_id` serialize on the row lock, and the loser sees `RowsAffected() == 0` and cleanly no-ops the rest of its transaction. An app-level check, however careful, can't offer that guarantee on its own.
+
+## What I'd change at 10,000 webhooks/sec
+
+A single Postgres table taking every insert, with each request opening a transaction, becomes the bottleneck well before that volume. I'd move the fast path to an append-only ingestion queue (Kafka or similar) keyed by `event_id`, acknowledge the webhook as soon as it's durably queued, and process it into Postgres asynchronously with the same idempotent-upsert logic, batched instead of one row at a time. I'd also shard `account_stats` writes or move them to an eventually-consistent aggregator (e.g. periodic rollup from the events log) rather than incrementing a single row per account on every request, since hot accounts would otherwise serialize on that row's lock. Recording processing would move off in-process goroutines entirely and onto a real worker pool with retries and a dead-letter queue, since a `sync.WaitGroup` in one process doesn't survive a crash, only a graceful shutdown.
