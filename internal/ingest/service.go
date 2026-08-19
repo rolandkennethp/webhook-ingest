@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -16,12 +17,21 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+// recordingProcessingTimeout bounds how long a single background recording
+// job may run once it has been detached from the originating request.
+const recordingProcessingTimeout = 30 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	// wg tracks recording-processing goroutines spawned by Ingest, so
+	// Shutdown can wait for them instead of letting them be silently
+	// killed when the process exits.
+	wg sync.WaitGroup
 }
 
 // New builds a Service.
@@ -36,16 +46,11 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
+//
+// Storing the delivery is idempotent: IngestEvent uses a DB-enforced unique
+// constraint on event_id inside a single transaction, so concurrent
+// redeliveries of the same event_id can never both be counted.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,22 +66,33 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.IngestEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
+		s.wg.Add(1)
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			defer s.wg.Done()
+
+			// Use a detached context, not the HTTP request's context: the
+			// request may finish (and its context be canceled) well before
+			// this work is done. Bound it with its own timeout instead.
+			bgCtx, cancel := context.WithTimeout(context.Background(), recordingProcessingTimeout)
+			defer cancel()
+
+			if err := s.processRecording(bgCtx, rec); err != nil {
+				s.log.Error("process recording failed",
+					"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}
@@ -89,4 +105,23 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
 	time.Sleep(recordingWork)
 	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+}
+
+// Shutdown waits for all in-flight recording-processing goroutines to
+// finish, or for ctx to be canceled, whichever happens first. Call this
+// from main() after the HTTP server has stopped accepting new requests, so
+// no in-flight background work is silently dropped on deploy.
+func (s *Service) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

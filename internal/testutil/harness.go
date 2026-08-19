@@ -61,6 +61,15 @@ func NewStore(t *testing.T) *store.Store {
 // Postgres and Redis, and returns it alongside the store for assertions.
 func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 	t.Helper()
+	srv, s, _ := NewServerWithService(t)
+	return srv, s
+}
+
+// NewServerWithService is like NewServer but also returns the Service
+// backing it, for tests that need to call Shutdown directly (e.g. to
+// assert that in-flight background work is drained on shutdown).
+func NewServerWithService(t *testing.T) (*httptest.Server, *store.Store, *ingest.Service) {
+	t.Helper()
 	cfg := config.Load()
 
 	s := NewStore(t)
@@ -76,5 +85,5 @@ func NewServer(t *testing.T) (*httptest.Server, *store.Store) {
 
 	srv := httptest.NewServer(httpapi.NewRouter(svc, log))
 	t.Cleanup(srv.Close)
-	return srv, s
+	return srv, s, svc
 }
